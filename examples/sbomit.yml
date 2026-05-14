@@ -85,7 +85,13 @@ jobs:
             BUILD="go build -trimpath ./..."
           elif [ -f Cargo.toml ]; then
             LANG="rust"
-            BUILD="cargo build --release --locked"
+            # --locked requires a checked-in Cargo.lock. Library crates (like rust-tuf)
+            # often don't commit one; binary crates do. Use --locked only when present.
+            if [ -f Cargo.lock ]; then
+              BUILD="cargo build --release --locked"
+            else
+              BUILD="cargo build --release"
+            fi
           elif [ -f package.json ]; then
             LANG="node"
             if grep -q '"build"' package.json; then
