@@ -180,7 +180,7 @@ jobs:
           # /opt/hostedtoolcache/Python/*/bin for Python). We explicitly preserve
           # PATH via `sudo env "PATH=$PATH"`. `-E` already preserves other env
           # vars (CARGO_HOME, GOROOT, pythonLocation, etc.).
-          sudo env "PATH=$PATH" -E witness run \
+          sudo -E env "PATH=$PATH" witness run \
             --step build \
             --trace $TRACE_BACKEND \
             --attestations "environment,git" \
