@@ -1,0 +1,219 @@
+# SBOMit Attestation — drop-in workflow
+#
+# WHAT THIS DOES
+#   On every push and pull request, this workflow:
+#     1. Auto-detects the project language (Go, Rust, Node, Python)
+#     2. Runs the build under `witness --trace --trace-backend ebpf`
+#        to produce a signed attestation of every file accessed
+#     3. Generates enriched SBOMs in SPDX 2.3 and CycloneDX 1.5
+#     4. Uploads attestation.json + both SBOMs + public key as artifacts
+#
+# NO SECRETS REQUIRED. NO EXTERNAL SERVICES.
+#
+# HOW TO USE
+#   1. Copy this file to .github/workflows/sbomit.yml in your repo
+#   2. (Optional) Set BUILD_COMMAND below if your build is non-standard
+#   3. Open a PR. That's it.
+#
+# CUSTOMIZATION
+#   - BUILD_COMMAND   override the auto-detected build command
+#   - SBOMIT_VERSION  pin the sbomit / witness binaries (default: v0.1.0)
+
+name: SBOMit Attestation
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  # Leave empty to auto-detect. Set to override (e.g. "make build" or "cargo build --release").
+  BUILD_COMMAND: ""
+  SBOMIT_VERSION: "v0.1.0"
+  SBOMIT_PIPELINE_REPO: "Marc-cn/sbomit-pipeline"
+
+jobs:
+  sbomit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # ── Language-specific toolchains ──────────────────────────────────────
+      # We always set up Go (witness/sbomit are Go binaries; cheap).
+      # Other toolchains conditionally activate based on detected files.
+      - name: Set up Go
+        if: hashFiles('go.mod') != ''
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Set up Rust
+        if: hashFiles('Cargo.toml') != ''
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Set up Node
+        if: hashFiles('package.json') != ''
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: ${{ hashFiles('package-lock.json') != '' && 'npm' || '' }}
+
+      - name: Set up Python
+        if: hashFiles('pyproject.toml') != '' || hashFiles('setup.py') != '' || hashFiles('setup.cfg') != ''
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+          cache: 'pip'
+
+      # ── Detect language and build command ─────────────────────────────────
+      - name: Detect build command
+        id: detect
+        run: |
+          set -euo pipefail
+          LANG="unknown"
+          BUILD=""
+
+          if   [ -f go.mod ]; then
+            LANG="go"
+            BUILD="go build -trimpath ./..."
+          elif [ -f Cargo.toml ]; then
+            LANG="rust"
+            BUILD="cargo build --release --locked"
+          elif [ -f package.json ]; then
+            LANG="node"
+            if grep -q '"build"' package.json; then
+              BUILD="npm ci && npm run build"
+            else
+              BUILD="npm ci"
+            fi
+          elif [ -f pyproject.toml ] || [ -f setup.py ] || [ -f setup.cfg ]; then
+            LANG="python"
+            if [ -f pyproject.toml ] && grep -q '\[build-system\]' pyproject.toml; then
+              BUILD="python -m pip install --upgrade pip build && python -m build --wheel"
+            elif [ -f requirements.txt ]; then
+              BUILD="python -m pip install --upgrade pip && python -m pip install -r requirements.txt"
+            else
+              BUILD="python -m pip install --upgrade pip && python -m pip install ."
+            fi
+          fi
+
+          if [ -n "${BUILD_COMMAND:-}" ]; then
+            BUILD="$BUILD_COMMAND"
+            echo "::notice::Build command overridden by BUILD_COMMAND env var"
+          fi
+
+          if [ -z "$BUILD" ]; then
+            echo "::error::Could not auto-detect a build command. Set BUILD_COMMAND in the workflow."
+            exit 1
+          fi
+
+          echo "language=$LANG"     >> "$GITHUB_OUTPUT"
+          echo "build_cmd=$BUILD"   >> "$GITHUB_OUTPUT"
+          echo "::notice::Language=$LANG  Build='$BUILD'"
+
+      # ── Install witness (eBPF-capable) and sbomit ─────────────────────────
+      - name: Install witness + sbomit
+        run: |
+          set -euo pipefail
+          REPO="${SBOMIT_PIPELINE_REPO}"
+          VER="${SBOMIT_VERSION}"
+          BASE="https://github.com/${REPO}/releases/download/${VER}"
+
+          for tool in witness-ebpf sbomit; do
+            curl -fsSL "${BASE}/${tool}-linux-amd64"        -o "/tmp/${tool}"
+            curl -fsSL "${BASE}/${tool}-linux-amd64.sha256" -o "/tmp/${tool}.sha256"
+            EXPECTED=$(awk '{print $1}' "/tmp/${tool}.sha256")
+            ACTUAL=$(sha256sum "/tmp/${tool}" | awk '{print $1}')
+            if [ "$EXPECTED" != "$ACTUAL" ]; then
+              echo "::error::sha256 mismatch for $tool (expected=$EXPECTED actual=$ACTUAL)"
+              exit 1
+            fi
+            chmod +x "/tmp/${tool}"
+          done
+          sudo mv /tmp/witness-ebpf /usr/local/bin/witness
+          sudo mv /tmp/sbomit       /usr/local/bin/sbomit
+          witness version
+          sbomit help | head -1
+
+      # ── Install syft for the SBOM catalog ─────────────────────────────────
+      - name: Install syft
+        run: |
+          curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh \
+            | sudo sh -s -- -b /usr/local/bin
+
+      # ── Generate ephemeral signing key (per-run) ──────────────────────────
+      - name: Generate ephemeral signing key
+        run: |
+          openssl genpkey -algorithm ed25519 -out signing.key
+          openssl pkey -in signing.key -pubout -out signing.pub
+
+      # ── Attest the build with witness (--trace --trace-backend ebpf) ──────
+      - name: Attest build with witness
+        env:
+          BUILD_CMD: ${{ steps.detect.outputs.build_cmd }}
+        run: |
+          set -euo pipefail
+          # Pick eBPF if supported by the installed witness, else fall back to ptrace.
+          TRACE_BACKEND=""
+          if witness run --help 2>&1 | grep -q -- "--trace-backend"; then
+            TRACE_BACKEND="--trace-backend ebpf"
+          fi
+          echo "::notice::Tracing with: --trace $TRACE_BACKEND"
+
+          sudo -E witness run \
+            --step build \
+            --trace $TRACE_BACKEND \
+            --attestations "environment,git" \
+            --signer-file-key-path signing.key \
+            --outfile attestation.json \
+            -- bash -c "$BUILD_CMD"
+
+          # Fix ownership so subsequent (non-sudo) steps can read the file
+          sudo chown "$USER" attestation.json
+          ls -la attestation.json
+
+      # ── Generate SBOMs in both formats ────────────────────────────────────
+      - name: Generate SBOMs (SPDX 2.3 + CycloneDX 1.5)
+        run: |
+          set -euo pipefail
+          mkdir -p sbom
+          PROJECT_NAME="${GITHUB_REPOSITORY##*/}"
+
+          sbomit generate attestation.json \
+            --name "$PROJECT_NAME" \
+            --format spdx23 \
+            --catalog syft \
+            --project-dir "$PWD" \
+            --output sbom/sbom.spdx.json
+
+          sbomit generate attestation.json \
+            --name "$PROJECT_NAME" \
+            --format cdx15 \
+            --catalog syft \
+            --project-dir "$PWD" \
+            --output sbom/sbom.cdx.json
+
+          ls -la sbom/
+          echo "---"
+          echo "SPDX package count: $(jq '.packages | length' sbom/sbom.spdx.json)"
+          echo "CDX component count: $(jq '.components | length' sbom/sbom.cdx.json)"
+
+      # ── Upload everything as a single artifact ────────────────────────────
+      - name: Upload attestation + SBOMs + public key
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbomit-${{ github.sha }}
+          path: |
+            attestation.json
+            sbom/sbom.spdx.json
+            sbom/sbom.cdx.json
+            signing.pub
+          retention-days: 90
+          if-no-files-found: error

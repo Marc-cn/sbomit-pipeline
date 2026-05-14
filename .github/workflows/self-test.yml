@@ -1,0 +1,42 @@
+# Quick sanity checks for the sbomit-pipeline repo itself.
+# Runs on every push: lints the example workflow, validates shell scripts,
+# and confirms the release URLs are reachable.
+
+name: Self-test
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Lint shell scripts
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck
+          shellcheck scripts/*.sh
+
+      - name: Validate example workflow YAML
+        run: |
+          python3 -c "import yaml,sys; yaml.safe_load(open('examples/sbomit.yml'))"
+          echo "✓ examples/sbomit.yml is valid YAML"
+
+      - name: Check release asset URLs are reachable
+        run: |
+          for asset in sbomit-linux-amd64 sbomit-linux-amd64.sha256 \
+                       witness-ebpf-linux-amd64 witness-ebpf-linux-amd64.sha256; do
+            url="https://github.com/Marc-cn/sbomit-pipeline/releases/download/v0.1.0/${asset}"
+            code=$(curl -sLI -o /dev/null -w "%{http_code}" "$url")
+            if [ "$code" != "200" ]; then
+              echo "::error::Missing release asset: $asset (HTTP $code)"
+              exit 1
+            fi
+            echo "✓ $asset reachable"
+          done
