@@ -175,7 +175,12 @@ jobs:
           fi
           echo "::notice::Tracing with: --trace $TRACE_BACKEND"
 
-          sudo -E witness run \
+          # sudo resets PATH to /etc/sudoers' `secure_path`, which omits the
+          # toolchain dirs that actions/setup-* add (e.g. ~/.cargo/bin for Rust,
+          # /opt/hostedtoolcache/Python/*/bin for Python). We explicitly preserve
+          # PATH via `sudo env "PATH=$PATH"`. `-E` already preserves other env
+          # vars (CARGO_HOME, GOROOT, pythonLocation, etc.).
+          sudo env "PATH=$PATH" -E witness run \
             --step build \
             --trace $TRACE_BACKEND \
             --attestations "environment,git" \
