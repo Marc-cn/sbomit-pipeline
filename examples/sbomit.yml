@@ -140,7 +140,9 @@ jobs:
           sudo mv /tmp/witness-ebpf /usr/local/bin/witness
           sudo mv /tmp/sbomit       /usr/local/bin/sbomit
           witness version
-          sbomit help | head -1
+          # Note: `sbomit help` produces many lines but `head -1` closes stdin early,
+          # causing SIGPIPE; under `set -o pipefail` that would fail the step.
+          sbomit help 2>&1 | head -1 || true
 
       # ── Install syft for the SBOM catalog ─────────────────────────────────
       - name: Install syft
