@@ -95,12 +95,18 @@ jobs:
             fi
           elif [ -f pyproject.toml ] || [ -f setup.py ] || [ -f setup.cfg ]; then
             LANG="python"
+            # Note: build runs under `sudo witness run`, so pip operations target
+            # the system Python. We avoid `pip install --upgrade pip` because Debian's
+            # dpkg-installed pip lacks a RECORD file and pip refuses to remove it,
+            # which fails the build. Using `--break-system-packages` to allow
+            # installing build tools alongside the system Python.
+            PIP="python -m pip install --break-system-packages --no-warn-script-location"
             if [ -f pyproject.toml ] && grep -q '\[build-system\]' pyproject.toml; then
-              BUILD="python -m pip install --upgrade pip build && python -m build --wheel"
+              BUILD="$PIP build && python -m build --wheel"
             elif [ -f requirements.txt ]; then
-              BUILD="python -m pip install --upgrade pip && python -m pip install -r requirements.txt"
+              BUILD="$PIP -r requirements.txt"
             else
-              BUILD="python -m pip install --upgrade pip && python -m pip install ."
+              BUILD="$PIP ."
             fi
           fi
 
