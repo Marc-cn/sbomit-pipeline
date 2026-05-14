@@ -182,12 +182,13 @@ jobs:
           ls -la attestation.json
 
       # ── Generate SBOMs in both formats ────────────────────────────────────
-      - name: Generate SBOMs (SPDX 2.3 + CycloneDX 1.5)
+      - name: Generate SBOMs (SPDX 2.3 + CycloneDX best-effort)
         run: |
           set -euo pipefail
           mkdir -p sbom
           PROJECT_NAME="${GITHUB_REPOSITORY##*/}"
 
+          # SPDX 2.3 — always produced. SPDX supports multi-root documents.
           sbomit generate attestation.json \
             --name "$PROJECT_NAME" \
             --format spdx23 \
@@ -195,17 +196,37 @@ jobs:
             --project-dir "$PWD" \
             --output sbom/sbom.spdx.json
 
-          sbomit generate attestation.json \
-            --name "$PROJECT_NAME" \
-            --format cdx15 \
-            --catalog syft \
-            --project-dir "$PWD" \
-            --output sbom/sbom.cdx.json
+          # CycloneDX — best-effort. Try 1.4 first (more permissive on multi-root),
+          # then 1.5. If both fail (e.g. project produces multiple binaries and
+          # sbomit can't serialize multi-root CDX), continue without failing the run.
+          CDX_OK=0
+          for fmt in cdx14 cdx15; do
+            if sbomit generate attestation.json \
+                --name "$PROJECT_NAME" \
+                --format "$fmt" \
+                --catalog syft \
+                --project-dir "$PWD" \
+                --output "sbom/sbom.cdx.json" 2>&1; then
+              echo "::notice::CycloneDX generated with format=$fmt"
+              CDX_OK=1
+              break
+            else
+              echo "::warning::CycloneDX format=$fmt failed, trying next..."
+            fi
+          done
+          if [ "$CDX_OK" = "0" ]; then
+            echo "::warning::CycloneDX generation skipped (sbomit cannot serialize this project's attestation to CDX yet). SPDX is unaffected."
+            rm -f sbom/sbom.cdx.json
+          fi
 
           ls -la sbom/
           echo "---"
-          echo "SPDX package count: $(jq '.packages | length' sbom/sbom.spdx.json)"
-          echo "CDX component count: $(jq '.components | length' sbom/sbom.cdx.json)"
+          echo "SPDX package count:  $(jq '.packages | length' sbom/sbom.spdx.json)"
+          if [ -f sbom/sbom.cdx.json ]; then
+            echo "CDX component count: $(jq '.components | length' sbom/sbom.cdx.json)"
+          else
+            echo "CDX component count: (skipped)"
+          fi
 
       # ── Upload everything as a single artifact ────────────────────────────
       - name: Upload attestation + SBOMs + public key
@@ -218,4 +239,8 @@ jobs:
             sbom/sbom.cdx.json
             signing.pub
           retention-days: 90
-          if-no-files-found: error
+          # 'warn' (not 'error') because sbom/sbom.cdx.json may be skipped if
+          # the project's attestation can't be serialized to CycloneDX yet.
+          # The other three files (attestation, SPDX, public key) are always
+          # produced on a successful run, so the artifact is never empty.
+          if-no-files-found: warn
