@@ -35,6 +35,10 @@ env:
   BUILD_COMMAND: ""
   SBOMIT_VERSION: "v0.1.0"
   SBOMIT_PIPELINE_REPO: "Marc-cn/sbomit-pipeline"
+  # Syft is pinned to a specific upstream release. We download the binary and
+  # the official checksums file separately, then verify before installing.
+  # Avoids `curl ... | sudo sh` (remote code execution on every CI run).
+  SYFT_VERSION: "1.44.0"
 
 jobs:
   sbomit:
@@ -156,11 +160,31 @@ jobs:
           # causing SIGPIPE; under `set -o pipefail` that would fail the step.
           sbomit help 2>&1 | head -1 || true
 
-      # ── Install syft for the SBOM catalog ─────────────────────────────────
+      # ── Install syft (pinned version, checksum-verified) ─────────────────
+      # Downloads the official syft release tarball and checksums.txt from
+      # anchore/syft, verifies the binary's sha256 against the official manifest,
+      # and only then installs. No `curl | sh`.
       - name: Install syft
         run: |
-          curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh \
-            | sudo sh -s -- -b /usr/local/bin
+          set -euo pipefail
+          VER="${SYFT_VERSION}"
+          BASE="https://github.com/anchore/syft/releases/download/v${VER}"
+          TARBALL="syft_${VER}_linux_amd64.tar.gz"
+          CHECKSUMS="syft_${VER}_checksums.txt"
+
+          cd /tmp
+          curl -fsSL "${BASE}/${TARBALL}"   -o "${TARBALL}"
+          curl -fsSL "${BASE}/${CHECKSUMS}" -o "${CHECKSUMS}"
+
+          # Verify just our tarball line from the checksums manifest.
+          # `sha256sum -c` exits non-zero if the hash doesn't match.
+          grep " ${TARBALL}\$" "${CHECKSUMS}" | sha256sum -c -
+          echo "::notice::syft ${VER} checksum verified"
+
+          tar -xzf "${TARBALL}" syft
+          sudo install -m 0755 syft /usr/local/bin/syft
+          # `syft version` may write more than head reads; protect against SIGPIPE under pipefail.
+          syft version 2>&1 | head -3 || true
 
       # ── Generate ephemeral signing key (per-run) ──────────────────────────
       - name: Generate ephemeral signing key
