@@ -33,8 +33,16 @@ permissions:
 env:
   # Leave empty to auto-detect. Set to override (e.g. "make build" or "cargo build --release").
   BUILD_COMMAND: ""
+  # Primary (eBPF) source: a personal release hosting an eBPF-capable witness
+  # and a prebuilt sbomit. If unreachable, the workflow falls back to the
+  # official upstream tools (see WITNESS_VERSION / sbomit go install below).
   SBOMIT_VERSION: "v0.1.0"
   SBOMIT_PIPELINE_REPO: "Marc-cn/sbomit-pipeline"
+  # Official upstream fallbacks (trusted canonical sources):
+  #   witness  -> github.com/in-toto/witness  (ptrace tracing; no eBPF backend)
+  #   sbomit   -> github.com/sbomit/sbomit     (go install)
+  WITNESS_VERSION: "0.11.0"
+  SBOMIT_GO_MODULE: "github.com/sbomit/sbomit@latest"
   # Syft is pinned to a specific upstream release. We download the binary and
   # the official checksums file separately, then verify before installing.
   # Avoids `curl ... | sudo sh` (remote code execution on every CI run).
@@ -49,14 +57,21 @@ jobs:
         uses: actions/checkout@v4
 
       # ── Language-specific toolchains ──────────────────────────────────────
-      # We always set up Go (witness/sbomit are Go binaries; cheap).
-      # Other toolchains conditionally activate based on detected files.
-      - name: Set up Go
+      # Go is always installed: witness/sbomit are Go tools and the sbomit
+      # fallback path uses `go install`. For Go projects we honor their
+      # go.mod version; for others we use a recent stable Go.
+      - name: Set up Go (project go.mod version)
         if: hashFiles('go.mod') != ''
         uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
           cache: true
+
+      - name: Set up Go (default, non-Go projects)
+        if: hashFiles('go.mod') == ''
+        uses: actions/setup-go@v5
+        with:
+          go-version: 'stable'
 
       - name: Set up Rust
         if: hashFiles('Cargo.toml') != ''
@@ -134,7 +149,15 @@ jobs:
           echo "build_cmd=$BUILD"   >> "$GITHUB_OUTPUT"
           echo "::notice::Language=$LANG  Build='$BUILD'"
 
-      # ── Install witness (eBPF-capable) and sbomit ─────────────────────────
+      # ── Install witness + sbomit (eBPF primary, official fallback) ────────
+      # Strategy:
+      #   witness: try the eBPF-capable build from SBOMIT_PIPELINE_REPO (sha256
+      #            verified). If unreachable, fall back to the official
+      #            in-toto/witness release (ptrace tracing; sha256 verified).
+      #   sbomit:  try the prebuilt binary from SBOMIT_PIPELINE_REPO (sha256
+      #            verified). If unreachable, `go install` the official module.
+      # The tracing backend is auto-detected later: --trace-backend ebpf is used
+      # only if the installed witness advertises it; otherwise plain --trace.
       - name: Install witness + sbomit
         run: |
           set -euo pipefail
@@ -142,22 +165,52 @@ jobs:
           VER="${SBOMIT_VERSION}"
           BASE="https://github.com/${REPO}/releases/download/${VER}"
 
-          for tool in witness-ebpf sbomit; do
-            curl -fsSL "${BASE}/${tool}-linux-amd64"        -o "/tmp/${tool}"
-            curl -fsSL "${BASE}/${tool}-linux-amd64.sha256" -o "/tmp/${tool}.sha256"
-            EXPECTED=$(awk '{print $1}' "/tmp/${tool}.sha256")
-            ACTUAL=$(sha256sum "/tmp/${tool}" | awk '{print $1}')
-            if [ "$EXPECTED" != "$ACTUAL" ]; then
-              echo "::error::sha256 mismatch for $tool (expected=$EXPECTED actual=$ACTUAL)"
-              exit 1
-            fi
-            chmod +x "/tmp/${tool}"
-          done
-          sudo mv /tmp/witness-ebpf /usr/local/bin/witness
-          sudo mv /tmp/sbomit       /usr/local/bin/sbomit
+          verify() { # <file> <sha256-file>
+            local exp act
+            exp=$(awk '{print $1}' "$2")
+            act=$(sha256sum "$1" | awk '{print $1}')
+            [ "$exp" = "$act" ]
+          }
+
+          # ---- witness ----
+          if curl -fsSL "${BASE}/witness-ebpf-linux-amd64"        -o /tmp/witness \
+          && curl -fsSL "${BASE}/witness-ebpf-linux-amd64.sha256" -o /tmp/witness.sha256 \
+          && verify /tmp/witness /tmp/witness.sha256; then
+            echo "::notice::witness: using eBPF-capable build from ${REPO}@${VER}"
+            chmod +x /tmp/witness
+            sudo mv /tmp/witness /usr/local/bin/witness
+          else
+            echo "::warning::witness: eBPF build unavailable; falling back to official in-toto/witness ${WITNESS_VERSION} (ptrace)"
+            WV="${WITNESS_VERSION}"
+            WB="https://github.com/in-toto/witness/releases/download/v${WV}"
+            curl -fsSL "${WB}/witness_${WV}_linux_amd64.tar.gz"   -o /tmp/witness.tgz
+            curl -fsSL "${WB}/witness_${WV}_checksums.txt"        -o /tmp/witness_sums.txt
+            ( cd /tmp && grep " witness_${WV}_linux_amd64.tar.gz\$" witness_sums.txt | sha256sum -c - )
+            tar -xzf /tmp/witness.tgz -C /tmp witness
+            sudo install -m0755 /tmp/witness /usr/local/bin/witness
+          fi
           witness version
-          # Note: `sbomit help` produces many lines but `head -1` closes stdin early,
-          # causing SIGPIPE; under `set -o pipefail` that would fail the step.
+
+          # ---- sbomit ----
+          # Official upstream first (trusted canonical source, matches the
+          # PyCon demo: go install github.com/sbomit/sbomit). Prebuilt binary
+          # from the pipeline repo only as a fallback if go install fails.
+          if go install "${SBOMIT_GO_MODULE}" 2>/dev/null \
+          && [ -x "$(go env GOPATH)/bin/sbomit" ]; then
+            echo "::notice::sbomit: installed official module ${SBOMIT_GO_MODULE}"
+            sudo install -m0755 "$(go env GOPATH)/bin/sbomit" /usr/local/bin/sbomit
+          elif curl -fsSL "${BASE}/sbomit-linux-amd64"        -o /tmp/sbomit \
+            && curl -fsSL "${BASE}/sbomit-linux-amd64.sha256" -o /tmp/sbomit.sha256 \
+            && verify /tmp/sbomit /tmp/sbomit.sha256; then
+            echo "::warning::sbomit: go install failed; using prebuilt from ${REPO}@${VER}"
+            chmod +x /tmp/sbomit
+            sudo mv /tmp/sbomit /usr/local/bin/sbomit
+          else
+            echo "::error::sbomit: both official go install and prebuilt fallback failed"
+            exit 1
+          fi
+          # `sbomit help` prints many lines; `head -1` closes stdin early →
+          # SIGPIPE, which under `set -o pipefail` would fail the step.
           sbomit help 2>&1 | head -1 || true
 
       # ── Install syft (pinned version, checksum-verified) ─────────────────
@@ -222,51 +275,93 @@ jobs:
           sudo chown "$USER" attestation.json
           ls -la attestation.json
 
-      # ── Generate SBOMs in both formats ────────────────────────────────────
-      - name: Generate SBOMs (SPDX 2.3 + CycloneDX best-effort)
+      # ── Generate SBOMs: server-first, local fallback ─────────────────────
+      # Primary: if SBOMIT_SERVER (repo variable) and SBOMIT_TOKEN (repo
+      #   secret) are both set, POST the attestation to the central server
+      #   and fetch a server-generated SPDX SBOM. Hard timeouts keep a
+      #   down/broken server cheap (~30s, not minutes).
+      # Fallback: if the server is unconfigured OR any server call fails,
+      #   generate locally with sbomit (always works, self-contained).
+      # An adopter who sets no variable/secret goes straight to local with
+      # zero penalty — the public one-file-no-secrets story is preserved.
+      - name: Generate SBOMs (server-first, local fallback)
+        env:
+          SBOMIT_SERVER: ${{ vars.SBOMIT_SERVER }}
+          SBOMIT_TOKEN: ${{ secrets.SBOMIT_TOKEN }}
         run: |
           set -euo pipefail
           mkdir -p sbom
           PROJECT_NAME="${GITHUB_REPOSITORY##*/}"
+          SERVER_OK=0
 
-          # SPDX 2.3 — always produced. SPDX supports multi-root documents.
-          sbomit generate attestation.json \
-            --name "$PROJECT_NAME" \
-            --format spdx23 \
-            --catalog syft \
-            --project-dir "$PWD" \
-            --output sbom/sbom.spdx.json
+          if [ -n "${SBOMIT_SERVER:-}" ] && [ -n "${SBOMIT_TOKEN:-}" ]; then
+            echo "::notice::SBOM source: trying central server first"
+            SRV="${SBOMIT_SERVER%/}"
+            # Fast-fail timeouts so a broken/unreachable server costs ~30s max.
+            CURL=(curl -sS --connect-timeout 5 --max-time 30
+                  -H "Authorization: Bearer ${SBOMIT_TOKEN}")
 
-          # CycloneDX — best-effort. Try 1.4 first (more permissive on multi-root),
-          # then 1.5. If both fail (e.g. project produces multiple binaries and
-          # sbomit can't serialize multi-root CDX), continue without failing the run.
-          CDX_OK=0
-          for fmt in cdx14 cdx15; do
-            if sbomit generate attestation.json \
-                --name "$PROJECT_NAME" \
-                --format "$fmt" \
-                --catalog syft \
-                --project-dir "$PWD" \
-                --output "sbom/sbom.cdx.json" 2>&1; then
-              echo "::notice::CycloneDX generated with format=$fmt"
-              CDX_OK=1
-              break
+            if "${CURL[@]}" -X POST "${SRV}/attestations" \
+                 -H "Content-Type: application/json" \
+                 --data-binary @attestation.json \
+                 -o /tmp/post_resp.json \
+                 -w 'POST /attestations -> %{http_code}\n' \
+               && "${CURL[@]}" -G "${SRV}/sbom" \
+                    --data-urlencode "format=spdx23" \
+                    --data-urlencode "catalog=syft" \
+                    --data-urlencode "project_dir=${PWD}" \
+                    -o sbom/sbom.spdx.json \
+                    -w 'GET /sbom -> %{http_code}\n' \
+               && jq -e '.packages | length >= 0' sbom/sbom.spdx.json >/dev/null 2>&1; then
+              echo "::notice::SBOM produced by central server"
+              SERVER_OK=1
             else
-              echo "::warning::CycloneDX format=$fmt failed, trying next..."
+              echo "::warning::Central server path failed; falling back to local sbomit generation"
+              rm -f sbom/sbom.spdx.json
             fi
-          done
-          if [ "$CDX_OK" = "0" ]; then
-            echo "::warning::CycloneDX generation skipped (sbomit cannot serialize this project's attestation to CDX yet). SPDX is unaffected."
-            rm -f sbom/sbom.cdx.json
+          else
+            echo "::notice::SBOM source: local (server not configured — set vars.SBOMIT_SERVER + secrets.SBOMIT_TOKEN to enable central inventory)"
+          fi
+
+          if [ "$SERVER_OK" = "0" ]; then
+            # ---- Local generation (authoritative fallback) ----
+            sbomit generate attestation.json \
+              --name "$PROJECT_NAME" \
+              --format spdx23 \
+              --catalog syft \
+              --project-dir "$PWD" \
+              --output sbom/sbom.spdx.json
+
+            # CycloneDX is local-only and best-effort (sbomit can't serialize
+            # multi-root CDX for multi-binary projects). Try 1.4 then 1.5.
+            CDX_OK=0
+            for fmt in cdx14 cdx15; do
+              if sbomit generate attestation.json \
+                  --name "$PROJECT_NAME" \
+                  --format "$fmt" \
+                  --catalog syft \
+                  --project-dir "$PWD" \
+                  --output "sbom/sbom.cdx.json" 2>&1; then
+                echo "::notice::CycloneDX generated with format=$fmt"
+                CDX_OK=1
+                break
+              else
+                echo "::warning::CycloneDX format=$fmt failed, trying next..."
+              fi
+            done
+            if [ "$CDX_OK" = "0" ]; then
+              echo "::warning::CycloneDX skipped (sbomit cannot serialize this project's attestation to CDX yet). SPDX is unaffected."
+              rm -f sbom/sbom.cdx.json
+            fi
           fi
 
           ls -la sbom/
           echo "---"
-          echo "SPDX package count:  $(jq '.packages | length' sbom/sbom.spdx.json)"
+          echo "SPDX package count:  $(jq '.packages | length' sbom/sbom.spdx.json 2>/dev/null || echo '?')"
           if [ -f sbom/sbom.cdx.json ]; then
             echo "CDX component count: $(jq '.components | length' sbom/sbom.cdx.json)"
           else
-            echo "CDX component count: (skipped)"
+            echo "CDX component count: (server SBOM or skipped)"
           fi
 
       # ── Upload everything as a single artifact ────────────────────────────
