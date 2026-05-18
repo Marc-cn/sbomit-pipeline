@@ -1,0 +1,25 @@
+# Copy this into your repo as: .github/workflows/sbomit.yml
+#
+# This is the entire integration. All pipeline logic lives in
+# Marc-cn/sbomit-pipeline and is pinned by the @v1 tag.
+
+name: SBOMit
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+jobs:
+  sbomit:
+    uses: Marc-cn/sbomit-pipeline/.github/workflows/sbomit-reusable.yml@v1
+
+    # ── Optional: only if your build is non-standard ──────────────────
+    # with:
+    #   build_command: "make just-install"
+
+    # ── Optional: only to send attestations to a central inventory ────
+    #   (omit entirely for the default self-contained, no-secret mode)
+    # with:
+    #   sbomit_server: "https://sbomit.example.org"
+    # secrets:
+    #   sbomit_token: ${{ secrets.SBOMIT_TOKEN }}

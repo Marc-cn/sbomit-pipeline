@@ -1,0 +1,452 @@
+# SBOMit Attestation — REUSABLE workflow (workflow_call)
+#
+# Maintainers do NOT copy this file. They add a ~5-line caller:
+#
+#   # .github/workflows/sbomit.yml in YOUR repo
+#   name: SBOMit
+#   on: [push, pull_request]
+#   jobs:
+#     sbomit:
+#       uses: Marc-cn/sbomit-pipeline/.github/workflows/sbomit-reusable.yml@v1
+#       # Optional — only if your build is non-standard:
+#       # with:
+#       #   build_command: "make just-install"
+#       # Optional — only to send attestations to a central inventory server:
+#       # with:
+#       #   sbomit_server: "https://your-server.example.com"
+#       # secrets:
+#       #   sbomit_token: ${{ secrets.SBOMIT_TOKEN }}
+#
+# NO SECRETS REQUIRED for the default (self-contained) mode.
+# See STANDARD-PROCEDURE.md for the full integration guide and security model.
+
+name: SBOMit Attestation (reusable)
+
+on:
+  workflow_call:
+    inputs:
+      build_command:
+        description: "Override the auto-detected build command (e.g. 'make just-install')."
+        required: false
+        type: string
+        default: ""
+      sbomit_server:
+        description: "Optional central inventory server base URL. If set (with sbomit_token), the SBOM is requested from the server first, falling back to local generation."
+        required: false
+        type: string
+        default: ""
+      sbomit_version:
+        description: "Pin for the eBPF witness / prebuilt sbomit release."
+        required: false
+        type: string
+        default: "v0.1.0"
+      sbomit_pipeline_repo:
+        description: "Repo hosting the eBPF witness + prebuilt sbomit release assets."
+        required: false
+        type: string
+        default: "Marc-cn/sbomit-pipeline"
+      witness_version:
+        description: "Official in-toto/witness fallback version (ptrace)."
+        required: false
+        type: string
+        default: "0.11.0"
+      sbomit_go_module:
+        description: "Official sbomit Go module (primary install path)."
+        required: false
+        type: string
+        default: "github.com/sbomit/sbomit@latest"
+      syft_version:
+        description: "Pinned syft release (downloaded + checksum-verified; no curl|sh)."
+        required: false
+        type: string
+        default: "1.44.0"
+    secrets:
+      sbomit_token:
+        description: "Bearer token for the central inventory server. Only needed if sbomit_server is set."
+        required: false
+
+permissions:
+  contents: read
+
+jobs:
+  sbomit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      BUILD_COMMAND: ${{ inputs.build_command }}
+      SBOMIT_VERSION: ${{ inputs.sbomit_version }}
+      SBOMIT_PIPELINE_REPO: ${{ inputs.sbomit_pipeline_repo }}
+      WITNESS_VERSION: ${{ inputs.witness_version }}
+      SBOMIT_GO_MODULE: ${{ inputs.sbomit_go_module }}
+      SYFT_VERSION: ${{ inputs.syft_version }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # ── Language-specific toolchains ──────────────────────────────────────
+      # Go is always installed: witness/sbomit are Go tools and the sbomit
+      # fallback path uses `go install`. For Go projects we honor their
+      # go.mod version; for others we use a recent stable Go.
+      - name: Set up Go (project go.mod version)
+        if: hashFiles('go.mod') != ''
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Set up Go (default, non-Go projects)
+        if: hashFiles('go.mod') == ''
+        uses: actions/setup-go@v5
+        with:
+          go-version: 'stable'
+
+      - name: Set up Rust
+        if: hashFiles('Cargo.toml') != ''
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Set up Node
+        if: hashFiles('package.json') != ''
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: ${{ hashFiles('package-lock.json') != '' && 'npm' || '' }}
+
+      - name: Set up Python
+        if: hashFiles('pyproject.toml') != '' || hashFiles('setup.py') != '' || hashFiles('setup.cfg') != ''
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+          cache: 'pip'
+
+      # ── Detect language and build command ─────────────────────────────────
+      - name: Detect build command
+        id: detect
+        run: |
+          set -euo pipefail
+          LANG="unknown"
+          BUILD=""
+
+          if   [ -f go.mod ]; then
+            LANG="go"
+            BUILD="go build -trimpath ./..."
+          elif [ -f Cargo.toml ]; then
+            LANG="rust"
+            # --locked requires a checked-in Cargo.lock. Library crates (like rust-tuf)
+            # often don't commit one; binary crates do. Use --locked only when present.
+            if [ -f Cargo.lock ]; then
+              BUILD="cargo build --release --locked"
+            else
+              BUILD="cargo build --release"
+            fi
+          elif [ -f package.json ]; then
+            LANG="node"
+            if grep -q '"build"' package.json; then
+              BUILD="npm ci && npm run build"
+            else
+              BUILD="npm ci"
+            fi
+          elif [ -f pyproject.toml ] || [ -f setup.py ] || [ -f setup.cfg ]; then
+            LANG="python"
+            # Note: build runs under `sudo witness run`, so pip operations target
+            # the system Python. We avoid `pip install --upgrade pip` because Debian's
+            # dpkg-installed pip lacks a RECORD file and pip refuses to remove it,
+            # which fails the build. Using `--break-system-packages` to allow
+            # installing build tools alongside the system Python.
+            PIP="python -m pip install --break-system-packages --no-warn-script-location"
+            if [ -f pyproject.toml ] && grep -q '\[build-system\]' pyproject.toml; then
+              BUILD="$PIP build && python -m build --wheel"
+            elif [ -f requirements.txt ]; then
+              BUILD="$PIP -r requirements.txt"
+            else
+              BUILD="$PIP ."
+            fi
+          fi
+
+          if [ -n "${BUILD_COMMAND:-}" ]; then
+            BUILD="$BUILD_COMMAND"
+            echo "::notice::Build command overridden by BUILD_COMMAND env var"
+          fi
+
+          if [ -z "$BUILD" ]; then
+            echo "::error::Could not auto-detect a build command. Set BUILD_COMMAND in the workflow."
+            exit 1
+          fi
+
+          echo "language=$LANG"     >> "$GITHUB_OUTPUT"
+          echo "build_cmd=$BUILD"   >> "$GITHUB_OUTPUT"
+          echo "::notice::Language=$LANG  Build='$BUILD'"
+
+      # ── Install witness + sbomit (eBPF primary, official fallback) ────────
+      # Strategy:
+      #   witness: try the eBPF-capable build from SBOMIT_PIPELINE_REPO (sha256
+      #            verified). If unreachable, fall back to the official
+      #            in-toto/witness release (ptrace tracing; sha256 verified).
+      #   sbomit:  try the prebuilt binary from SBOMIT_PIPELINE_REPO (sha256
+      #            verified). If unreachable, `go install` the official module.
+      # The tracing backend is auto-detected later: --trace-backend ebpf is used
+      # only if the installed witness advertises it; otherwise plain --trace.
+      - name: Install witness + sbomit
+        run: |
+          set -euo pipefail
+          REPO="${SBOMIT_PIPELINE_REPO}"
+          VER="${SBOMIT_VERSION}"
+          BASE="https://github.com/${REPO}/releases/download/${VER}"
+
+          verify() { # <file> <sha256-file>
+            local exp act
+            exp=$(awk '{print $1}' "$2")
+            act=$(sha256sum "$1" | awk '{print $1}')
+            [ "$exp" = "$act" ]
+          }
+
+          # ---- witness ----
+          if curl -fsSL "${BASE}/witness-ebpf-linux-amd64"        -o /tmp/witness \
+          && curl -fsSL "${BASE}/witness-ebpf-linux-amd64.sha256" -o /tmp/witness.sha256 \
+          && verify /tmp/witness /tmp/witness.sha256; then
+            echo "::notice::witness: using eBPF-capable build from ${REPO}@${VER}"
+            chmod +x /tmp/witness
+            sudo mv /tmp/witness /usr/local/bin/witness
+          else
+            echo "::warning::witness: eBPF build unavailable; falling back to official in-toto/witness ${WITNESS_VERSION} (ptrace)"
+            WV="${WITNESS_VERSION}"
+            WB="https://github.com/in-toto/witness/releases/download/v${WV}"
+            curl -fsSL "${WB}/witness_${WV}_linux_amd64.tar.gz"   -o /tmp/witness.tgz
+            curl -fsSL "${WB}/witness_${WV}_checksums.txt"        -o /tmp/witness_sums.txt
+            ( cd /tmp && grep " witness_${WV}_linux_amd64.tar.gz\$" witness_sums.txt | sha256sum -c - )
+            tar -xzf /tmp/witness.tgz -C /tmp witness
+            sudo install -m0755 /tmp/witness /usr/local/bin/witness
+          fi
+          witness version
+
+          # ---- sbomit ----
+          # Official upstream first (trusted canonical source, matches the
+          # PyCon demo: go install github.com/sbomit/sbomit). Prebuilt binary
+          # from the pipeline repo only as a fallback if go install fails.
+          if go install "${SBOMIT_GO_MODULE}" 2>/dev/null \
+          && [ -x "$(go env GOPATH)/bin/sbomit" ]; then
+            echo "::notice::sbomit: installed official module ${SBOMIT_GO_MODULE}"
+            sudo install -m0755 "$(go env GOPATH)/bin/sbomit" /usr/local/bin/sbomit
+          elif curl -fsSL "${BASE}/sbomit-linux-amd64"        -o /tmp/sbomit \
+            && curl -fsSL "${BASE}/sbomit-linux-amd64.sha256" -o /tmp/sbomit.sha256 \
+            && verify /tmp/sbomit /tmp/sbomit.sha256; then
+            echo "::warning::sbomit: go install failed; using prebuilt from ${REPO}@${VER}"
+            chmod +x /tmp/sbomit
+            sudo mv /tmp/sbomit /usr/local/bin/sbomit
+          else
+            echo "::error::sbomit: both official go install and prebuilt fallback failed"
+            exit 1
+          fi
+          # `sbomit help` prints many lines; `head -1` closes stdin early →
+          # SIGPIPE, which under `set -o pipefail` would fail the step.
+          sbomit help 2>&1 | head -1 || true
+
+      # ── Install syft (pinned version, checksum-verified) ─────────────────
+      # Downloads the official syft release tarball and checksums.txt from
+      # anchore/syft, verifies the binary's sha256 against the official manifest,
+      # and only then installs. No `curl | sh`.
+      - name: Install syft
+        run: |
+          set -euo pipefail
+          VER="${SYFT_VERSION}"
+          BASE="https://github.com/anchore/syft/releases/download/v${VER}"
+          TARBALL="syft_${VER}_linux_amd64.tar.gz"
+          CHECKSUMS="syft_${VER}_checksums.txt"
+
+          cd /tmp
+          curl -fsSL "${BASE}/${TARBALL}"   -o "${TARBALL}"
+          curl -fsSL "${BASE}/${CHECKSUMS}" -o "${CHECKSUMS}"
+
+          # Verify just our tarball line from the checksums manifest.
+          # `sha256sum -c` exits non-zero if the hash doesn't match.
+          grep " ${TARBALL}\$" "${CHECKSUMS}" | sha256sum -c -
+          echo "::notice::syft ${VER} checksum verified"
+
+          tar -xzf "${TARBALL}" syft
+          sudo install -m 0755 syft /usr/local/bin/syft
+          # `syft version` may write more than head reads; protect against SIGPIPE under pipefail.
+          syft version 2>&1 | head -3 || true
+
+      # ── Generate ephemeral signing key (per-run) ──────────────────────────
+      - name: Generate ephemeral signing key
+        run: |
+          openssl genpkey -algorithm ed25519 -out signing.key
+          openssl pkey -in signing.key -pubout -out signing.pub
+
+      # ── Attest the build with witness (--trace --trace-backend ebpf) ──────
+      - name: Attest build with witness
+        env:
+          BUILD_CMD: ${{ steps.detect.outputs.build_cmd }}
+        run: |
+          set -euo pipefail
+          # Pick eBPF if supported by the installed witness, else fall back to ptrace.
+          TRACE_BACKEND=""
+          if witness run --help 2>&1 | grep -q -- "--trace-backend"; then
+            TRACE_BACKEND="--trace-backend ebpf"
+          fi
+          echo "::notice::Tracing with: --trace $TRACE_BACKEND"
+
+          # sudo resets PATH to /etc/sudoers' `secure_path`, which omits the
+          # toolchain dirs that actions/setup-* add (e.g. ~/.cargo/bin for Rust,
+          # /opt/hostedtoolcache/Python/*/bin for Python). We explicitly preserve
+          # PATH via `sudo env "PATH=$PATH"`. `-E` already preserves other env
+          # vars (CARGO_HOME, GOROOT, pythonLocation, etc.).
+          sudo -E env "PATH=$PATH" witness run \
+            --step build \
+            --trace $TRACE_BACKEND \
+            --attestations "environment,git" \
+            --signer-file-key-path signing.key \
+            --outfile attestation.json \
+            -- bash -c "$BUILD_CMD"
+
+          # Fix ownership so subsequent (non-sudo) steps can read the file
+          sudo chown "$USER" attestation.json
+          ls -la attestation.json
+
+      # ── Generate SBOMs: server-first, local fallback ─────────────────────
+      # Primary: if SBOMIT_SERVER (repo variable) and SBOMIT_TOKEN (repo
+      #   secret) are both set, POST the attestation to the central server
+      #   and fetch a server-generated SPDX SBOM. Hard timeouts keep a
+      #   down/broken server cheap (~30s, not minutes).
+      # Fallback: if the server is unconfigured OR any server call fails,
+      #   generate locally with sbomit (always works, self-contained).
+      # An adopter who sets no variable/secret goes straight to local with
+      # zero penalty — the public one-file-no-secrets story is preserved.
+      - name: Generate SBOMs (server-first, local fallback)
+        env:
+          SBOMIT_SERVER: ${{ inputs.sbomit_server }}
+          SBOMIT_TOKEN: ${{ secrets.sbomit_token }}
+        run: |
+          set -euo pipefail
+          mkdir -p sbom
+          PROJECT_NAME="${GITHUB_REPOSITORY##*/}"
+          SERVER_OK=0
+
+          if [ -n "${SBOMIT_SERVER:-}" ] && [ -n "${SBOMIT_TOKEN:-}" ]; then
+            echo "::notice::SBOM source: trying central server first"
+            SRV="${SBOMIT_SERVER%/}"
+            # Fast-fail timeouts so a broken/unreachable server costs ~30s max.
+            # NOTE: we capture the HTTP status explicitly and test it. We do NOT
+            # rely on curl's exit code alone — curl exits 0 even for a 4xx/5xx
+            # because the error body downloads "successfully". A 400 page must
+            # NOT be mistaken for a valid SBOM.
+            CURL=(curl -sS --connect-timeout 5 --max-time 30
+                  -H "Authorization: Bearer ${SBOMIT_TOKEN}")
+
+            server_ok=1
+
+            # 1. POST attestation (populates the central store). 2xx required.
+            POST_CODE=$("${CURL[@]}" -o /tmp/post_resp.json -w '%{http_code}' \
+              -X POST "${SRV}/attestations" \
+              -H "Content-Type: application/json" \
+              --data-binary @attestation.json || echo "000")
+            echo "POST /attestations -> ${POST_CODE}"
+            case "$POST_CODE" in
+              2??) : ;;                       # accepted into central store
+              *)   echo "::warning::POST /attestations returned ${POST_CODE}"
+                   server_ok=0 ;;
+            esac
+
+            # 2. GET server-generated SBOM. 2xx required.
+            #    NOTE: we deliberately do NOT send catalog=syft / project_dir.
+            #    The server runs syft against a *local* directory; project_dir
+            #    is a path on THIS runner that does not exist in the server's
+            #    container, so that mode always 400s. The server's correct
+            #    remote mode builds the SBOM from the attestation we just
+            #    POSTed (witness --trace materials/products). Syft enrichment
+            #    remains the LOCAL fallback's advantage (the runner has source).
+            if [ "$server_ok" = "1" ]; then
+              SBOM_CODE=$("${CURL[@]}" -o sbom/sbom.spdx.json -w '%{http_code}' \
+                -G "${SRV}/sbom" \
+                --data-urlencode "format=spdx23" || echo "000")
+              echo "GET /sbom -> ${SBOM_CODE}"
+              case "$SBOM_CODE" in
+                2??) : ;;
+                *)   echo "::warning::GET /sbom returned ${SBOM_CODE}"
+                     server_ok=0 ;;
+              esac
+            fi
+
+            # 3. Validate it is a REAL SPDX doc with actual packages.
+            #    (Guards against a 2xx that returns an empty/garbage body.)
+            #    NB: in jq, '|' binds looser than 'and', so every piped
+            #    sub-expression is wrapped in its own parentheses.
+            if [ "$server_ok" = "1" ]; then
+              if jq -e '(has("spdxVersion"))
+                        and ((.spdxVersion | type) == "string")
+                        and ((.packages | type) == "array")
+                        and ((.packages | length) > 0)' \
+                   sbom/sbom.spdx.json >/dev/null 2>&1; then
+                PKGS=$(jq '.packages | length' sbom/sbom.spdx.json)
+                echo "::notice::SBOM produced by central server (${PKGS} packages)"
+                SERVER_OK=1
+              else
+                echo "::warning::Server returned ${SBOM_CODE} but body is not a valid non-empty SPDX document"
+                server_ok=0
+              fi
+            fi
+
+            if [ "$server_ok" = "0" ]; then
+              echo "::warning::Central server path failed; falling back to local sbomit generation"
+              rm -f sbom/sbom.spdx.json
+            fi
+          else
+            echo "::notice::SBOM source: local (server not configured — set vars.SBOMIT_SERVER + secrets.SBOMIT_TOKEN to enable central inventory)"
+          fi
+
+          if [ "$SERVER_OK" = "0" ]; then
+            # ---- Local generation (authoritative fallback) ----
+            sbomit generate attestation.json \
+              --name "$PROJECT_NAME" \
+              --format spdx23 \
+              --catalog syft \
+              --project-dir "$PWD" \
+              --output sbom/sbom.spdx.json
+
+            # CycloneDX is local-only and best-effort (sbomit can't serialize
+            # multi-root CDX for multi-binary projects). Try 1.4 then 1.5.
+            CDX_OK=0
+            for fmt in cdx14 cdx15; do
+              if sbomit generate attestation.json \
+                  --name "$PROJECT_NAME" \
+                  --format "$fmt" \
+                  --catalog syft \
+                  --project-dir "$PWD" \
+                  --output "sbom/sbom.cdx.json" 2>&1; then
+                echo "::notice::CycloneDX generated with format=$fmt"
+                CDX_OK=1
+                break
+              else
+                echo "::warning::CycloneDX format=$fmt failed, trying next..."
+              fi
+            done
+            if [ "$CDX_OK" = "0" ]; then
+              echo "::warning::CycloneDX skipped (sbomit cannot serialize this project's attestation to CDX yet). SPDX is unaffected."
+              rm -f sbom/sbom.cdx.json
+            fi
+          fi
+
+          ls -la sbom/
+          echo "---"
+          echo "SPDX package count:  $(jq '.packages | length' sbom/sbom.spdx.json 2>/dev/null || echo '?')"
+          if [ -f sbom/sbom.cdx.json ]; then
+            echo "CDX component count: $(jq '.components | length' sbom/sbom.cdx.json)"
+          else
+            echo "CDX component count: (server SBOM or skipped)"
+          fi
+
+      # ── Upload everything as a single artifact ────────────────────────────
+      - name: Upload attestation + SBOMs + public key
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbomit-${{ github.sha }}
+          path: |
+            attestation.json
+            sbom/sbom.spdx.json
+            sbom/sbom.cdx.json
+            signing.pub
+          retention-days: 90
+          # 'warn' (not 'error') because sbom/sbom.cdx.json may be skipped if
+          # the project's attestation can't be serialized to CycloneDX yet.
+          # The other three files (attestation, SPDX, public key) are always
+          # produced on a successful run, so the artifact is never empty.
+          if-no-files-found: warn
