@@ -320,12 +320,17 @@ jobs:
             esac
 
             # 2. GET server-generated SBOM. 2xx required.
+            #    NOTE: we deliberately do NOT send catalog=syft / project_dir.
+            #    The server runs syft against a *local* directory; project_dir
+            #    is a path on THIS runner that does not exist in the server's
+            #    container, so that mode always 400s. The server's correct
+            #    remote mode builds the SBOM from the attestation we just
+            #    POSTed (witness --trace materials/products). Syft enrichment
+            #    remains the LOCAL fallback's advantage (the runner has source).
             if [ "$server_ok" = "1" ]; then
               SBOM_CODE=$("${CURL[@]}" -o sbom/sbom.spdx.json -w '%{http_code}' \
                 -G "${SRV}/sbom" \
-                --data-urlencode "format=spdx23" \
-                --data-urlencode "catalog=syft" \
-                --data-urlencode "project_dir=${PWD}" || echo "000")
+                --data-urlencode "format=spdx23" || echo "000")
               echo "GET /sbom -> ${SBOM_CODE}"
               case "$SBOM_CODE" in
                 2??) : ;;
