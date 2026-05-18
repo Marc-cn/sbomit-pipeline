@@ -8,11 +8,6 @@ every file accessed, process spawned, and (where supported) network call, then
 derives an enriched SBOM from that evidence. SBOMs built this way
 reflect the real build, not a manifest's claims about it.
 
-> **Goal:** zero-friction adoption for maintainers, with a security posture
-> consistent with what a supply-chain tool should model.
-
----
-
 ## Integrate it (pick one)
 
 All three options deliver the **identical, validated pipeline**.
