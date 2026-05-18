@@ -10,13 +10,12 @@ reflect the real build, not a manifest's claims about it.
 
 ## Integrate it (pick one)
 
-All three options deliver the **identical, validated pipeline**.
+Both options deliver the **identical, validated pipeline**.
 
 | Option | What you do | Dependency | Best for |
 |--------|-------------|------------|----------|
 | **1. Generator** *(recommended)* | review + run one command; a self-contained workflow is written into your repo | none (you own the file) | full ownership, no runtime dependency |
-| **2. Reusable workflow** | add a ~5-line workflow referencing `@v1` | `@v1` (auto-updates) | hands-off compatible updates |
-| **3. Manual copy** | copy `examples/sbomit.yml` in by hand | none | zero tooling |
+| **2. Reusable workflow** | add a ~5-line workflow referencing `@v1` | `@v1` (auto-updates) | automatic fixes, no manual action |
 
 Full reference: **[`STANDARD-PROCEDURE.md`](STANDARD-PROCEDURE.md)**.
 
@@ -45,6 +44,11 @@ server URL it sets the non-secret `SBOMIT_SERVER` repository variable and
 **prints** the command for you to set the `SBOMIT_TOKEN` secret yourself; the
 script never handles your token value.
 
+> **Prefer not to run any script?** The file the generator installs is
+> [`examples/sbomit.yml`](examples/sbomit.yml). You can copy it into
+> `.github/workflows/sbomit.yml` by hand instead — you simply forgo the
+> automatic SHA-256 integrity check the generator performs for you.
+
 ### Option 2 — the reusable workflow
 
 Add `.github/workflows/sbomit.yml`:
@@ -64,12 +68,6 @@ jobs:
 All logic lives here and is pinned by `@v1`; you get backward-compatible fixes
 automatically. Override a non-standard build with
 `with: { build_command: "make just-install" }`.
-
-### Option 3 — manual copy
-
-Copy [`examples/sbomit.yml`](examples/sbomit.yml) directly into
-`.github/workflows/sbomit.yml`. Same self-contained file Option 1 installs,
-copied by hand. You own it; no automatic updates.
 
 ---
 
@@ -138,7 +136,7 @@ sbomit-pipeline/
 ├── .github/workflows/
 │   └── sbomit-reusable.yml              ← Option 2: the reusable pipeline (workflow_call)
 ├── examples/
-│   ├── sbomit.yml                       ← Option 3: standalone copy (self-contained)
+│   ├── sbomit.yml                       ← the self-contained workflow (installed by the generator)
 │   ├── sbomit.yml.sha256                ← integrity companion (verified by the generator)
 │   ├── caller-example.yml               ← the ~5-line Option-2 snippet
 │   └── README.md
@@ -178,7 +176,7 @@ workflow artifact, so each build can be audited end to end.
 ## Status
 
 Validated end-to-end across five real projects spanning the supported
-ecosystems (Go, Python, Rust). The server-first path and all three integration
+ecosystems (Go, Python, Rust). The server-first path and both integration
 options have been proven in CI.
 
 Part of the OpenSSF **SBOMit** effort.
