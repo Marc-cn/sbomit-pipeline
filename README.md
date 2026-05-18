@@ -1,6 +1,6 @@
 # SBOMit Pipeline
 
-Build-time **attestation + SBOM generation** for any GitHub project.
+Build-time **attestation + SBOM generation** for any project.
 
 The pipeline runs your build under [`witness`](https://github.com/in-toto/witness),
 producing a signed, tamper-evident record of what the build *actually did* —
