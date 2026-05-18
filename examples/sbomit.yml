@@ -298,24 +298,62 @@ jobs:
             echo "::notice::SBOM source: trying central server first"
             SRV="${SBOMIT_SERVER%/}"
             # Fast-fail timeouts so a broken/unreachable server costs ~30s max.
+            # NOTE: we capture the HTTP status explicitly and test it. We do NOT
+            # rely on curl's exit code alone — curl exits 0 even for a 4xx/5xx
+            # because the error body downloads "successfully". A 400 page must
+            # NOT be mistaken for a valid SBOM.
             CURL=(curl -sS --connect-timeout 5 --max-time 30
                   -H "Authorization: Bearer ${SBOMIT_TOKEN}")
 
-            if "${CURL[@]}" -X POST "${SRV}/attestations" \
-                 -H "Content-Type: application/json" \
-                 --data-binary @attestation.json \
-                 -o /tmp/post_resp.json \
-                 -w 'POST /attestations -> %{http_code}\n' \
-               && "${CURL[@]}" -G "${SRV}/sbom" \
-                    --data-urlencode "format=spdx23" \
-                    --data-urlencode "catalog=syft" \
-                    --data-urlencode "project_dir=${PWD}" \
-                    -o sbom/sbom.spdx.json \
-                    -w 'GET /sbom -> %{http_code}\n' \
-               && jq -e '.packages | length >= 0' sbom/sbom.spdx.json >/dev/null 2>&1; then
-              echo "::notice::SBOM produced by central server"
-              SERVER_OK=1
-            else
+            server_ok=1
+
+            # 1. POST attestation (populates the central store). 2xx required.
+            POST_CODE=$("${CURL[@]}" -o /tmp/post_resp.json -w '%{http_code}' \
+              -X POST "${SRV}/attestations" \
+              -H "Content-Type: application/json" \
+              --data-binary @attestation.json || echo "000")
+            echo "POST /attestations -> ${POST_CODE}"
+            case "$POST_CODE" in
+              2??) : ;;                       # accepted into central store
+              *)   echo "::warning::POST /attestations returned ${POST_CODE}"
+                   server_ok=0 ;;
+            esac
+
+            # 2. GET server-generated SBOM. 2xx required.
+            if [ "$server_ok" = "1" ]; then
+              SBOM_CODE=$("${CURL[@]}" -o sbom/sbom.spdx.json -w '%{http_code}' \
+                -G "${SRV}/sbom" \
+                --data-urlencode "format=spdx23" \
+                --data-urlencode "catalog=syft" \
+                --data-urlencode "project_dir=${PWD}" || echo "000")
+              echo "GET /sbom -> ${SBOM_CODE}"
+              case "$SBOM_CODE" in
+                2??) : ;;
+                *)   echo "::warning::GET /sbom returned ${SBOM_CODE}"
+                     server_ok=0 ;;
+              esac
+            fi
+
+            # 3. Validate it is a REAL SPDX doc with actual packages.
+            #    (Guards against a 2xx that returns an empty/garbage body.)
+            #    NB: in jq, '|' binds looser than 'and', so every piped
+            #    sub-expression is wrapped in its own parentheses.
+            if [ "$server_ok" = "1" ]; then
+              if jq -e '(has("spdxVersion"))
+                        and ((.spdxVersion | type) == "string")
+                        and ((.packages | type) == "array")
+                        and ((.packages | length) > 0)' \
+                   sbom/sbom.spdx.json >/dev/null 2>&1; then
+                PKGS=$(jq '.packages | length' sbom/sbom.spdx.json)
+                echo "::notice::SBOM produced by central server (${PKGS} packages)"
+                SERVER_OK=1
+              else
+                echo "::warning::Server returned ${SBOM_CODE} but body is not a valid non-empty SPDX document"
+                server_ok=0
+              fi
+            fi
+
+            if [ "$server_ok" = "0" ]; then
               echo "::warning::Central server path failed; falling back to local sbomit generation"
               rm -f sbom/sbom.spdx.json
             fi
