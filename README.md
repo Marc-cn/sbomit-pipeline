@@ -3,7 +3,7 @@
 Build-time **attestation + SBOM generation** for any project.
 
 The pipeline runs your build under [`witness`](https://github.com/in-toto/witness),
-producing a signed, tamper-evident record of what the build *actually did*, 
+producing a signed, tamper-evident record of what the build *actually did*,
 every file accessed, process spawned, and (where supported) network call, then
 derives an enriched SBOM from that evidence. SBOMs built this way
 reflect the real build, not a manifest's claims about it.
@@ -14,44 +14,29 @@ Both options deliver the **identical, validated pipeline**.
 
 | Option | What you do | Dependency | Best for |
 |--------|-------------|------------|----------|
-| **1. Generator** *(recommended)* | review + run one command; a self-contained workflow is written into your repo | none (you own the file) | full ownership, no runtime dependency |
-| **2. Reusable workflow** | add a ~5-line workflow referencing `@v1` | `@v1` (auto-updates) | automatic fixes, no manual action |
+| **1. Copy the workflow file** *(recommended)* | drop `examples/sbomit.yml` into `.github/workflows/` in your repo | none (you own the file) | full ownership, no runtime dependency |
+| **2. Reference the reusable workflow** | add a ~5-line workflow with `uses: …@v1` | `@v1` (auto-updates) | automatic fixes, no manual action |
 
 Full reference: **[`STANDARD-PROCEDURE.md`](STANDARD-PROCEDURE.md)**.
 
-### Option 1 — the generator (recommended)
+### Option 1 — copy the workflow file (recommended)
 
 From the root of your git repository:
 
 ```bash
-# 1. Download the integration script (pinned release)
-curl -fsSLO https://raw.githubusercontent.com/Marc-cn/sbomit-pipeline/v1.0.0/sbomit-integrate.sh
-
-# 2. REVIEW it (short, documented, performs no privileged actions)
-less sbomit-integrate.sh
-
-# 3. Run it — local-only:
-sh sbomit-integrate.sh
-#    ...or also wire a central inventory server:
-sh sbomit-integrate.sh https://your-sbomit-server.example.org
+mkdir -p .github/workflows
+curl -fsSL \
+  https://raw.githubusercontent.com/Marc-cn/sbomit-pipeline/v1/examples/sbomit.yml \
+  -o .github/workflows/sbomit.yml
 ```
 
-The script fetches the standalone workflow from a **pinned tag**, verifies it
-against a **published SHA-256** before writing anything (aborts on mismatch),
-and writes `.github/workflows/sbomit.yml`. It is meant to be downloaded and
-read before running — not piped from the network into a shell. If you pass a
-server URL it sets the non-secret `SBOMIT_SERVER` repository variable and
-**prints** the command for you to set the `SBOMIT_TOKEN` secret yourself; the
-script never handles your token value.
+Review the file, commit it, push, open a PR. You now own the file; there is
+no runtime dependency on any external repository. To update later, re-download
+and review the diff.
 
-> **Prefer not to run any script?** The file the generator installs is
-> [`examples/sbomit.yml`](examples/sbomit.yml). You can copy it into
-> `.github/workflows/sbomit.yml` by hand instead — you simply forgo the
-> automatic SHA-256 integrity check the generator performs for you.
+### Option 2 — reference the reusable workflow
 
-### Option 2 — the reusable workflow
-
-Add `.github/workflows/sbomit.yml`:
+Create `.github/workflows/sbomit.yml` in your repo with:
 
 ```yaml
 name: SBOMit
@@ -65,8 +50,8 @@ jobs:
     uses: Marc-cn/sbomit-pipeline/.github/workflows/sbomit-reusable.yml@v1
 ```
 
-All logic lives here and is pinned by `@v1`; you get backward-compatible fixes
-automatically. Override a non-standard build with
+All logic lives in this repository and is pinned by `@v1`; you receive
+backward-compatible fixes automatically. Override a non-standard build with
 `with: { build_command: "make just-install" }`.
 
 ---
@@ -76,7 +61,7 @@ automatically. Override a non-standard build with
 On every push and pull request:
 
 1. **Auto-detects** the project language (Go, Rust, Node, Python).
-2. **Installs tooling** (pinned, checksum-verified — never `curl | sh`):
+2. **Installs tooling** (pinned, checksum-verified):
    - `witness` — eBPF-capable build first; falls back to the official
      `in-toto/witness` release (ptrace) if unavailable.
    - `sbomit` — official module `go install github.com/sbomit/sbomit` first;
@@ -108,7 +93,7 @@ no external services.
 Supplying `SBOMIT_SERVER` (repo variable) and `SBOMIT_TOKEN` (repo secret)
 makes each run also send its attestation to a central server and retrieve a
 server-generated SBOM — a single place to query "which projects use this
-vulnerable library?". This is strictly opt-in; without both set, the code path
+vulnerable library?". Strictly opt-in; without both set, the code path
 does not run and there is zero overhead. The server builds the SBOM from the
 attestation itself and never accesses your source.
 
@@ -119,7 +104,7 @@ attestation itself and never accesses your source.
 Releases follow the GitHub Actions convention:
 
 - **`@v1`** — latest backward-compatible `v1.x`; recommended for most projects.
-- **`@v1.0.0`** — immutable exact version; use for strict reproducibility.
+- **`@v1.0.1`** — immutable exact version; use for strict reproducibility.
 
 Breaking changes only ever appear under a new major tag (`@v2`), never within
 an existing one.
@@ -132,12 +117,10 @@ an existing one.
 sbomit-pipeline/
 ├── README.md                            ← this file
 ├── STANDARD-PROCEDURE.md                ← full maintainer integration reference
-├── sbomit-integrate.sh                  ← Option 1: self-serve generator
 ├── .github/workflows/
 │   └── sbomit-reusable.yml              ← Option 2: the reusable pipeline (workflow_call)
 ├── examples/
-│   ├── sbomit.yml                       ← the self-contained workflow (installed by the generator)
-│   ├── sbomit.yml.sha256                ← integrity companion (verified by the generator)
+│   ├── sbomit.yml                       ← Option 1: copy this into your repo
 │   ├── caller-example.yml               ← the ~5-line Option-2 snippet
 │   └── README.md
 └── scripts/                             ← standalone helpers (advanced/diagnostic use)
@@ -158,18 +141,6 @@ witness verify \
 
 `attestation.json`, `signing.pub`, and the SBOM(s) all come from the same
 workflow artifact, so each build can be audited end to end.
-
----
-
-## Security posture
-
-- **No piped remote execution.** Every tool is downloaded at a pinned version
-  and SHA-256-verified before it runs. The generator is download-and-review,
-  not `curl | sh`.
-- **No secrets in the default path.** Central inventory is strictly opt-in.
-- **Fail-safe SBOM acceptance.** Server responses are validated by HTTP status
-  and SPDX content; anything invalid falls back to local generation rather
-  than shipping an empty SBOM.
 
 ---
 
