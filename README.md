@@ -11,7 +11,7 @@ Both options deliver the **identical, validated pipeline**.
 
 | Option | What you do | Dependency | Best for |
 |--------|-------------|------------|----------|
-| **1. Copy the workflow file** *(recommended)* | drop `examples/sbomit.yml` into `.github/workflows/` in your repo | none (you own the file) | full ownership, no runtime dependency |
+| **1. Copy the workflow file** | drop `examples/sbomit.yml` into `.github/workflows/` in your repo | none (you own the file) | full ownership, no runtime dependency |
 | **2. Reference the reusable workflow** | add a ~5-line workflow with `uses: …@v1` | `@v1` (auto-updates) | automatic fixes, no manual action |
 
 Full reference: **[`STANDARD-PROCEDURE.md`](STANDARD-PROCEDURE.md)**.
@@ -67,7 +67,7 @@ On every push and pull request:
      checksum manifest.
 3. **Generates** an ephemeral ED25519 signing key for the run.
 4. **Runs the build under `witness`**, capturing build-time facts as a signed
-   attestation (eBPF tracing where available, otherwise ptrace).
+   attestation (eBPF tracing where available).
 5. **Produces the SBOM — server-first with local fallback:**
    - If a central server is configured (`SBOMIT_SERVER` + `SBOMIT_TOKEN`), the
      attestation is POSTed there and a server-generated SPDX SBOM is fetched.
@@ -80,12 +80,7 @@ On every push and pull request:
 6. **Uploads** `attestation.json`, the SBOM(s), and the public key as a single
    workflow artifact.
 
-If no server is configured the pipeline is fully self-contained: no secrets,
-no external services.
-
----
-
-## Optional: central inventory
+## Optional: central server
 
 Supplying `SBOMIT_SERVER` (repo variable) and `SBOMIT_TOKEN` (repo secret)
 makes each run also send its attestation to a central server and retrieve a
