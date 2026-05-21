@@ -142,12 +142,3 @@ witness verify \
 `attestation.json`, `signing.pub`, and the SBOM(s) all come from the same
 workflow artifact, so each build can be audited end to end.
 
----
-
-## Status
-
-Validated end-to-end across five real projects spanning the supported
-ecosystems (Go, Python, Rust). The server-first path and both integration
-options have been proven in CI.
-
-Part of the OpenSSF **SBOMit** effort.
