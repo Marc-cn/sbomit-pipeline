@@ -1,12 +1,9 @@
 # SBOMit Pipeline
 
-Build-time **attestation + SBOM generation** for any project.
+**attestation + SBOM generation**.
 
 The pipeline runs your build under [`witness`](https://github.com/in-toto/witness),
-producing a signed, tamper-evident record of what the build *actually did*,
-every file accessed, process spawned, and (where supported) network call, then
-derives an enriched SBOM from that evidence. SBOMs built this way
-reflect the real build, not a manifest's claims about it.
+producing a signed, tamper-evident record of what the build *actually did*. 
 
 ## Integrate it (pick one)
 
